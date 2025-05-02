@@ -1,0 +1,234 @@
+import torch
+import torch.nn as nn
+import numpy as np
+from typing import Tuple, Dict, List, Optional
+
+class TimeSeriesLSTM(nn.Module):
+    def __init__(
+        self, 
+        input_dim: int, 
+        hidden_dim: int = 128, 
+        num_layers: int = 2,
+        dropout: float = 0.2,
+        bidirectional: bool = True,
+        attention: bool = True,
+        forecast_horizon: int = 1
+    ):
+        super(TimeSeriesLSTM, self).__init__()
+        
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.bidirectional = bidirectional
+        self.attention = attention
+        self.forecast_horizon = forecast_horizon
+        
+        # LSTM layers
+        self.lstm = nn.LSTM(
+            input_size=input_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0,
+            bidirectional=bidirectional
+        )
+        
+        # Multiplicative attention mechanism
+        if attention:
+            self.attention_weights = nn.Linear(
+                hidden_dim * 2 if bidirectional else hidden_dim, 
+                1
+            )
+        
+        # Output layers for multi-horizon forecasting
+        lstm_output_dim = hidden_dim * 2 if bidirectional else hidden_dim
+        self.output_layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(lstm_output_dim, 64),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(64, 1)
+            ) for _ in range(forecast_horizon)
+        ])
+        
+        # Uncertainty estimation (aleatoric uncertainty)
+        self.uncertainty_layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(lstm_output_dim, 64),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(64, 1),
+                nn.Softplus()  # Ensure positive variance
+            ) for _ in range(forecast_horizon)
+        ])
+        
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Forward pass through the network
+        
+        Args:
+            x: Input tensor of shape (batch_size, sequence_length, input_dim)
+            
+        Returns:
+            Tuple containing:
+            - predictions: Tensor of shape (batch_size, forecast_horizon)
+            - uncertainties: Tensor of shape (batch_size, forecast_horizon)
+            - attention_weights: Tensor of shape (batch_size, sequence_length) if attention=True, else None
+        """
+        # LSTM forward pass
+        lstm_out, _ = self.lstm(x)  # (batch_size, seq_len, hidden_dim*2 if bidirectional)
+        
+        # Apply attention if enabled
+        if self.attention:
+            # Calculate attention scores
+            attention_scores = self.attention_weights(lstm_out)  # (batch_size, seq_len, 1)
+            attention_scores = attention_scores.squeeze(-1)  # (batch_size, seq_len)
+            attention_weights = torch.softmax(attention_scores, dim=1)  # (batch_size, seq_len)
+            
+            # Apply attention weights
+            attention_weights_expanded = attention_weights.unsqueeze(-1)  # (batch_size, seq_len, 1)
+            context_vector = torch.sum(lstm_out * attention_weights_expanded, dim=1)  # (batch_size, hidden_dim)
+        else:
+            # Use last hidden state if no attention
+            context_vector = lstm_out[:, -1, :]  # (batch_size, hidden_dim)
+            attention_weights = None
+        
+        # Multi-horizon prediction
+        predictions = []
+        uncertainties = []
+        
+        for i in range(self.forecast_horizon):
+            pred = self.output_layers[i](context_vector)  # (batch_size, 1)
+            uncertainty = self.uncertainty_layers[i](context_vector)  # (batch_size, 1)
+            
+            predictions.append(pred)
+            uncertainties.append(uncertainty)
+        
+        # Stack predictions and uncertainties along forecast_horizon dimension
+        predictions = torch.cat(predictions, dim=1)  # (batch_size, forecast_horizon)
+        uncertainties = torch.cat(uncertainties, dim=1)  # (batch_size, forecast_horizon)
+        
+        return predictions, uncertainties, attention_weights
+
+
+class TimeSeriesTransformer(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        d_model: int = 128,
+        nhead: int = 8,
+        num_encoder_layers: int = 4,
+        dim_feedforward: int = 512,
+        dropout: float = 0.1,
+        forecast_horizon: int = 1
+    ):
+        super(TimeSeriesTransformer, self).__init__()
+        
+        self.input_dim = input_dim
+        self.d_model = d_model
+        self.forecast_horizon = forecast_horizon
+        
+        # Input encoding
+        self.input_projection = nn.Linear(input_dim, d_model)
+        
+        # Positional encoding
+        self.pos_encoder = PositionalEncoding(d_model, dropout)
+        
+        # Transformer encoder
+        encoder_layers = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer=encoder_layers,
+            num_layers=num_encoder_layers
+        )
+        
+        # Output projection for multi-horizon forecasting
+        self.output_layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model, 64),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(64, 1)
+            ) for _ in range(forecast_horizon)
+        ])
+        
+        # Uncertainty estimation (aleatoric uncertainty)
+        self.uncertainty_layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model, 64),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(64, 1),
+                nn.Softplus()  # Ensure positive variance
+            ) for _ in range(forecast_horizon)
+        ])
+    
+    def forward(self, x: torch.Tensor, src_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass through the network
+        
+        Args:
+            x: Input tensor of shape (batch_size, sequence_length, input_dim)
+            src_mask: Optional mask tensor of shape (sequence_length, sequence_length)
+            
+        Returns:
+            Tuple containing:
+            - predictions: Tensor of shape (batch_size, forecast_horizon)
+            - uncertainties: Tensor of shape (batch_size, forecast_horizon)
+        """
+        # Project input to d_model dimensions
+        x = self.input_projection(x)  # (batch_size, seq_len, d_model)
+        
+        # Add positional encoding
+        x = self.pos_encoder(x)  # (batch_size, seq_len, d_model)
+        
+        # Transformer encoder
+        transformer_output = self.transformer_encoder(x, src_mask)  # (batch_size, seq_len, d_model)
+        
+        # Use the last sequence element for forecasting
+        decoder_input = transformer_output[:, -1, :]  # (batch_size, d_model)
+        
+        # Multi-horizon prediction
+        predictions = []
+        uncertainties = []
+        
+        for i in range(self.forecast_horizon):
+            pred = self.output_layers[i](decoder_input)  # (batch_size, 1)
+            uncertainty = self.uncertainty_layers[i](decoder_input)  # (batch_size, 1)
+            
+            predictions.append(pred)
+            uncertainties.append(uncertainty)
+        
+        # Stack predictions and uncertainties along forecast_horizon dimension
+        predictions = torch.cat(predictions, dim=1)  # (batch_size, forecast_horizon)
+        uncertainties = torch.cat(uncertainties, dim=1)  # (batch_size, forecast_horizon)
+        
+        return predictions, uncertainties
+
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-np.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, d_model)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        
+        self.register_buffer('pe', pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Tensor, shape [batch_size, seq_len, embedding_dim]
+        """
+        x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)
