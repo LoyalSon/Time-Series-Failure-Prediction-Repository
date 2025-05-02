@@ -1,0 +1,18 @@
+time-series-failure-prediction/
+├── README.md
+├── requirements.txt
+├── src/
+│   ├── __init__.py
+│   ├── data_processing.py
+│   ├── feature_engineering.py
+│   ├── models.py
+│   ├── training.py
+│   └── evaluation.py
+├── notebooks/
+│   ├── 01_data_exploration.ipynb
+│   ├── 02_feature_engineering.ipynb
+│   ├── 03_model_training.ipynb
+│   └── 04_model_evaluation.ipynb
+└── docs/
+    ├── model_architecture.png
+    └── performance_metrics.md
